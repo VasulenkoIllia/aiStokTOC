@@ -10,7 +10,9 @@ type ExplainParams = {
 
 type ExplainPayload = {
   sku: string
+  sku_name: string | null
   warehouse_id: string
+  warehouse_name: string | null
   date: string
   zone: 'Red' | 'Yellow' | 'Green'
   avg_daily_demand: number
@@ -45,6 +47,23 @@ const DEFAULT_BUFFER_FACTOR = 1.2
 export async function buildExplainPayload(params: ExplainParams): Promise<ExplainPayload | null> {
   const targetDate = params.date ? new Date(params.date) : new Date()
   const isoDate = targetDate.toISOString().slice(0, 10)
+  const [catalogSku, warehouse] = await Promise.all([
+    prisma.catalog.findUnique({
+      where: {
+        org_id_sku: {
+          org_id: params.orgId,
+          sku: params.sku,
+        },
+      },
+      select: { name: true },
+    }),
+    prisma.warehouses.findUnique({
+      where: { id: params.warehouseId },
+      select: { name: true },
+    }),
+  ])
+  const skuName = catalogSku?.name ?? null
+  const warehouseName = warehouse?.name ?? null
 
   const buffer = await prisma.buffers.findUnique({
     where: {
@@ -104,7 +123,9 @@ export async function buildExplainPayload(params: ExplainParams): Promise<Explai
 
   return {
     sku: params.sku,
+    sku_name: skuName,
     warehouse_id: params.warehouseId,
+    warehouse_name: warehouseName,
     date: isoDate,
     zone,
     avg_daily_demand: round(avgDailyDemand),

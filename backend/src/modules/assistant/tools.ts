@@ -1,9 +1,14 @@
 import { Prisma } from '@prisma/client'
-import { addDays, formatISO, startOfDay, subDays } from 'date-fns'
+import { addDays, formatISO, startOfDay, subDays, getISOWeek } from 'date-fns'
 import { z } from 'zod'
 import { prisma } from '../../db/client'
 import { getRecommendations } from '../recommendations/service'
 import { buildExplainPayload } from './payload'
+import {
+  WEEKDAY_SEASONALITY_BASELINE_MIN_UNITS,
+  WEEKDAY_SEASONALITY_MIN_WEEKS,
+  WEEKDAY_SEASONALITY_THRESHOLD_PCT,
+} from './constants'
 
 type ToolContext = {
   orgId: string
@@ -31,6 +36,8 @@ type StockSnapshotRow = {
   expiry_date: Date | null
   date: Date
 }
+
+const DEFAULT_SALES_WINDOWS = [10, 30, 60, 90]
 
 const numberLike = z
   .union([z.number(), z.string().trim().transform(Number)])
@@ -79,9 +86,45 @@ const getSalesSummarySchema = z.object({
   warehouse_id: z.string().trim().min(2).max(64).optional(),
   from: z.string().trim().optional(),
   to: z.string().trim().optional(),
+  days: numberLike.optional(),
   group_by: z.enum(['warehouse', 'sku', 'sku_warehouse']).optional(),
   metric: z.enum(['units', 'revenue']).optional(),
   limit: numberLike.optional(),
+})
+
+const getSalesWindowsSchema = z.object({
+  sku: z.string().trim().min(1).optional(),
+  warehouse_id: z.string().trim().min(2).max(64).optional(),
+  windows: z.array(numberLike).optional(),
+})
+
+const getSkuSalesTimeseriesSchema = z.object({
+  sku: z.string().trim().min(1),
+  warehouse_id: z.string().trim().min(2).max(64).optional(),
+  from: z.string().trim().optional(),
+  to: z.string().trim().optional(),
+  limit: numberLike.optional(),
+})
+
+const getWeekdaySeasonalitySchema = z.object({
+  sku: z.string().trim().min(1).optional(),
+  warehouse_id: z.string().trim().min(2).max(64).optional(),
+  from: z.string().trim().optional(),
+  to: z.string().trim().optional(),
+  lookback_days: numberLike.optional(),
+  min_weeks: numberLike.optional(),
+  threshold_pct: numberLike.optional(),
+  limit: numberLike.optional(),
+})
+
+const getPeriodicSeasonalitySchema = z.object({
+  sku: z.string().trim().min(1).optional(),
+  warehouse_id: z.string().trim().min(2).max(64).optional(),
+  from: z.string().trim().optional(),
+  to: z.string().trim().optional(),
+  lookback_days: numberLike.optional(),
+  granularities: z.array(z.enum(['weekday', 'day_of_month', 'month'])).optional(),
+  limit_per_granularity: numberLike.optional(),
 })
 
 const suggestRebalanceSchema = z.object({
@@ -154,17 +197,560 @@ export const assistantTools: ToolDefinition[] = [
         _sum: { units: Prisma.Decimal | null; revenue: Prisma.Decimal | null }
       }>
 
+      const skuNameMap = await loadSkuNames(
+        orgId,
+        rows.map((row) => row.sku),
+      )
+      const warehouseMetadata = await resolveFilterMetadata(
+        orgId,
+        null,
+        parsed.warehouse_id ?? null,
+      )
+
       return {
         warehouse_id: parsed.warehouse_id ?? null,
+        warehouse_name: warehouseMetadata.warehouse_name,
         metric,
         lookback_days: days,
         from: formatISO(since, { representation: 'date' }),
         to: formatISO(new Date(), { representation: 'date' }),
         items: rows.map((row) => ({
           sku: row.sku,
+          sku_name: skuNameMap.get(row.sku) ?? null,
           units: Number(row._sum.units ?? 0),
           revenue: Number(row._sum.revenue ?? 0),
         })),
+      }
+    },
+  },
+  {
+    name: 'get_sku_sales_timeseries',
+    description:
+      'Повертає часовий ряд продажів (sales_daily) для конкретного SKU, агрегований по днях (по всій організації або конкретному складу).',
+    parameters: {
+      type: 'object',
+      properties: {
+        sku: {
+          type: 'string',
+          description: 'SKU, для якого потрібен часовий ряд (обовʼязково).',
+        },
+        warehouse_id: {
+          type: 'string',
+          description: 'ID складу. Якщо не вказано — агрегується по всіх складах.',
+        },
+        from: {
+          type: 'string',
+          description: 'Дата початку (YYYY-MM-DD). За замовчуванням 90 днів тому.',
+        },
+        to: {
+          type: 'string',
+          description: 'Дата завершення (YYYY-MM-DD). За замовчуванням сьогодні.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Максимальна кількість днів у серії (1..365, за замовчуванням 120).',
+        },
+      },
+      required: ['sku'],
+    },
+    handler: async ({ orgId }, args) => {
+      const parsed = getSkuSalesTimeseriesSchema.parse(args ?? {})
+      const today = startOfDay(new Date())
+      const toDate = startOfDay(safeParseDate(parsed.to) ?? today)
+      const fromDate = startOfDay(safeParseDate(parsed.from) ?? subDays(toDate, 90))
+      const limit = clampNumber(parsed.limit ?? 120, 1, 365)
+
+      const rows = (await prisma.sales_daily.groupBy({
+        by: parsed.warehouse_id ? (['date', 'warehouse_id'] as const) : (['date'] as const),
+        where: {
+          org_id: orgId,
+          sku: parsed.sku,
+          date: {
+            gte: fromDate,
+            lte: toDate,
+          },
+          ...(parsed.warehouse_id ? { warehouse_id: parsed.warehouse_id } : {}),
+        },
+        _sum: {
+          units: true,
+          revenue: true,
+        },
+        orderBy: {
+          date: 'asc',
+        },
+      })) as Array<{
+        date: Date
+        warehouse_id?: string
+        _sum: { units: Prisma.Decimal | null; revenue: Prisma.Decimal | null }
+      }>
+
+      const limitedRows = rows.slice(-limit)
+      const skuNameMap = await loadSkuNames(orgId, [parsed.sku])
+      const warehouseIdSet = new Set<string>()
+      if (parsed.warehouse_id) warehouseIdSet.add(parsed.warehouse_id)
+      limitedRows.forEach((row) => {
+        if (row.warehouse_id) {
+          warehouseIdSet.add(row.warehouse_id)
+        }
+      })
+      const warehouseNameMap = await loadWarehouseNames(Array.from(warehouseIdSet))
+      const skuName = skuNameMap.get(parsed.sku) ?? null
+      const defaultWarehouseName = parsed.warehouse_id
+        ? warehouseNameMap.get(parsed.warehouse_id) ?? null
+        : null
+
+      return {
+        sku: parsed.sku,
+        sku_name: skuName,
+        warehouse_id: parsed.warehouse_id ?? null,
+        warehouse_name: defaultWarehouseName,
+        from: formatISO(fromDate, { representation: 'date' }),
+        to: formatISO(toDate, { representation: 'date' }),
+        total_days: rows.length,
+        series: limitedRows.map((row) => {
+          const pointWarehouseId = parsed.warehouse_id ? row.warehouse_id ?? parsed.warehouse_id : null
+          return {
+            date: formatISO(row.date, { representation: 'date' }),
+            warehouse_id: parsed.warehouse_id ? pointWarehouseId : null,
+            warehouse_name: pointWarehouseId
+              ? warehouseNameMap.get(pointWarehouseId) ?? null
+              : null,
+            units: Number(row._sum.units ?? 0),
+            revenue: Number(row._sum.revenue ?? 0),
+          }
+        }),
+      }
+    },
+  },
+  {
+    name: 'get_weekday_seasonality',
+    description:
+      'Шукає SKU/склади, де певний день тижня стабільно продається значно краще за інші (тижнева сезонність).',
+    parameters: {
+      type: 'object',
+      properties: {
+        sku: {
+          type: 'string',
+          description: 'Опційно аналіз одного SKU. Якщо не вказано — шукаємо по всій організації.',
+        },
+        warehouse_id: {
+          type: 'string',
+          description: 'Опційно обмежити склад.',
+        },
+        from: {
+          type: 'string',
+          description: 'Початок періоду (YYYY-MM-DD). Альтернатива lookback_days.',
+        },
+        to: {
+          type: 'string',
+          description: 'Кінець періоду (YYYY-MM-DD).',
+        },
+        lookback_days: {
+          type: 'number',
+          description: 'Скільки днів аналізувати (1..180, за замовчуванням 60), якщо не задано from/to.',
+        },
+        min_weeks: {
+          type: 'number',
+          description: 'Мінімум тижнів, де спостерігали пік (1..12, за замовчуванням 4).',
+        },
+        threshold_pct: {
+          type: 'number',
+          description: 'Поріг відриву від середнього в %, за замовчуванням 30.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Скільки результатів повернути (1..50, за замовчуванням 10).',
+        },
+      },
+    },
+    handler: async ({ orgId }, args) => {
+      const parsed = getWeekdaySeasonalitySchema.parse(args ?? {})
+      const today = startOfDay(new Date())
+      const toDate = startOfDay(safeParseDate(parsed.to) ?? today)
+      const fromDate = startOfDay(
+        parsed.from
+          ? new Date(parsed.from)
+          : subDays(toDate, clampNumber(Number(parsed.lookback_days ?? 60), 14, 180)),
+      )
+      const toDateExclusive = addDays(toDate, 1)
+      const toDateInclusive = addDays(toDateExclusive, -1)
+      const minWeeks = clampNumber(
+        Number(parsed.min_weeks ?? WEEKDAY_SEASONALITY_MIN_WEEKS),
+        1,
+        12,
+      )
+      const threshold =
+        clampNumber(
+          Number(parsed.threshold_pct ?? WEEKDAY_SEASONALITY_THRESHOLD_PCT),
+          5,
+          200,
+        ) / 100
+      const limit = clampNumber(Number(parsed.limit ?? 10), 1, 50)
+      const filterMetadataPromise = resolveFilterMetadata(
+        orgId,
+        parsed.sku ?? null,
+        parsed.warehouse_id ?? null,
+      )
+
+      const rows = (await prisma.sales_daily.findMany({
+        where: {
+          org_id: orgId,
+          date: {
+            gte: fromDate,
+            lt: toDateExclusive,
+          },
+          ...(parsed.sku ? { sku: parsed.sku } : {}),
+          ...(parsed.warehouse_id ? { warehouse_id: parsed.warehouse_id } : {}),
+        },
+        select: {
+          sku: true,
+          warehouse_id: true,
+          date: true,
+          units: true,
+        },
+      })) as Array<{ sku: string; warehouse_id: string | null; date: Date; units: Prisma.Decimal | null }>
+
+      if (!rows.length) {
+        const filterMetadata = await filterMetadataPromise
+        return {
+          message: 'За обраний період не знайдено продажів.',
+          from: formatISO(fromDate, { representation: 'date' }),
+          to: formatISO(toDateInclusive, { representation: 'date' }),
+          min_weeks: minWeeks,
+          threshold_pct: threshold * 100,
+          baseline_min_units: WEEKDAY_SEASONALITY_BASELINE_MIN_UNITS,
+          filters: {
+            sku: parsed.sku ?? null,
+            warehouse_id: parsed.warehouse_id ?? null,
+            sku_name: filterMetadata.sku_name,
+            warehouse_name: filterMetadata.warehouse_name,
+          },
+          sensitivity: {
+            threshold_pct: threshold * 100,
+            min_weeks: minWeeks,
+            baseline_min_units: WEEKDAY_SEASONALITY_BASELINE_MIN_UNITS,
+          },
+        }
+      }
+
+      const bucketMap = new Map<
+        string,
+        {
+          sku: string
+          warehouse_id: string | null
+          totalUnits: number
+          totalCount: number
+          weekdays: Map<number, { sum: number; count: number; weeks: Set<string> }>
+        }
+      >()
+
+      for (const row of rows) {
+        const key = `${row.sku}::${row.warehouse_id ?? 'ALL'}`
+        let bucket = bucketMap.get(key)
+        if (!bucket) {
+          bucket = {
+            sku: row.sku,
+            warehouse_id: row.warehouse_id ?? null,
+            totalUnits: 0,
+            totalCount: 0,
+            weekdays: new Map(),
+          }
+          bucketMap.set(key, bucket)
+        }
+        const units = Number(row.units ?? 0)
+        bucket.totalUnits += units
+        bucket.totalCount += 1
+        const weekday = row.date.getUTCDay() || 7 // convert Sunday(0) to 7
+        const weekdayBucket = bucket.weekdays.get(weekday) ?? { sum: 0, count: 0, weeks: new Set<string>() }
+        weekdayBucket.sum += units
+        weekdayBucket.count += 1
+        weekdayBucket.weeks.add(getWeekKey(row.date))
+        bucket.weekdays.set(weekday, weekdayBucket)
+      }
+
+      const results: Array<{
+        sku: string
+        warehouse_id: string | null
+        weekday: number
+        weekday_label: string
+        avg_units: number
+        other_avg_units: number
+        baseline_avg_units: number
+        uplift_pct: number
+        weeks_with_peak: number
+      }> = []
+
+      for (const bucket of bucketMap.values()) {
+        if (!bucket.totalCount) continue
+        const totalOtherBase = bucket.totalUnits
+        const totalOtherCount = bucket.totalCount
+        const weekdayEntries = Array.from(bucket.weekdays.entries()).map(([weekday, data]) => ({
+          weekday,
+          avg: data.sum / Math.max(data.count, 1),
+          weeks: data.weeks.size,
+          count: data.count,
+          sum: data.sum,
+        }))
+        weekdayEntries.sort((a, b) => b.avg - a.avg)
+        for (const entry of weekdayEntries) {
+          if (entry.weeks < minWeeks) continue
+          const otherSum = totalOtherBase - entry.sum
+          const otherCount = Math.max(totalOtherCount - entry.count, 1)
+          const otherAvg = otherSum / otherCount
+          if (otherAvg <= 0) continue
+          const uplift = entry.avg / otherAvg - 1
+          if (uplift < threshold) continue
+          const baselineUnits = Math.max(otherAvg, WEEKDAY_SEASONALITY_BASELINE_MIN_UNITS)
+          const friendlyUplift =
+            baselineUnits > 0 ? ((entry.avg - otherAvg) / baselineUnits) * 100 : 0
+          results.push({
+            sku: bucket.sku,
+            warehouse_id: bucket.warehouse_id,
+            weekday: entry.weekday,
+            weekday_label: weekdayLabel(entry.weekday),
+            avg_units: Number(entry.avg.toFixed(2)),
+            other_avg_units: Number(otherAvg.toFixed(2)),
+            baseline_avg_units: Number(baselineUnits.toFixed(2)),
+            uplift_pct: Number(friendlyUplift.toFixed(1)),
+            weeks_with_peak: entry.weeks,
+          })
+          break
+        }
+      }
+
+      const filterMetadata = await filterMetadataPromise
+      if (!results.length) {
+        return {
+          message: 'Не вдалося знайти стабільні піки продажів за днями тижня.',
+          from: formatISO(fromDate, { representation: 'date' }),
+          to: formatISO(toDateInclusive, { representation: 'date' }),
+          min_weeks: minWeeks,
+          threshold_pct: threshold * 100,
+          baseline_min_units: WEEKDAY_SEASONАЛITY_BASELINE_MIN_UNITS,
+          filters: {
+            sku: parsed.sku ?? null,
+            warehouse_id: parsed.warehouse_id ?? null,
+            sku_name: filterMetadata.sku_name,
+            warehouse_name: filterMetadata.warehouse_name,
+          },
+          sensitivity: {
+            threshold_pct: threshold * 100,
+            min_weeks: minWeeks,
+            baseline_min_units: WEEKDAY_SEASONАЛITY_BASELINE_MIN_UNITS,
+          },
+        }
+      }
+
+      const skuIdsForLookup = new Set<string>()
+      const warehouseIdsForLookup = new Set<string>()
+      results.forEach((row) => {
+        skuIdsForLookup.add(row.sku)
+        if (row.warehouse_id) warehouseIdsForLookup.add(row.warehouse_id)
+      })
+      if (parsed.sku) skuIdsForLookup.add(parsed.sku)
+      if (parsed.warehouse_id) warehouseIdsForLookup.add(parsed.warehouse_id)
+      const [resultSkuNameMap, resultWarehouseNameMap] = await Promise.all([
+        loadSkuNames(orgId, Array.from(skuIdsForLookup)),
+        loadWarehouseNames(Array.from(warehouseIdsForLookup)),
+      ])
+
+      results.sort((a, b) => b.uplift_pct - a.uplift_pct || b.avg_units - a.avg_units)
+
+      return {
+        from: formatISO(fromDate, { representation: 'date' }),
+        to: formatISO(toDateInclusive, { representation: 'date' }),
+        min_weeks: minWeeks,
+        threshold_pct: threshold * 100,
+        baseline_min_units: WEEKDAY_SEASONАЛITY_BASELINE_MIN_UNITS,
+        filters: {
+          sku: parsed.sku ?? null,
+          warehouse_id: parsed.warehouse_id ?? null,
+          sku_name: filterMetadata.sku_name,
+          warehouse_name: filterMetadata.warehouse_name,
+        },
+        sensitivity: {
+          threshold_pct: threshold * 100,
+          min_weeks: minWeeks,
+          baseline_min_units: WEEKDAY_SEASONАЛITY_BASELINE_MIN_UNITS,
+        },
+        items: results.slice(0, limit).map((item) => ({
+          ...item,
+          sku_name: resultSkuNameMap.get(item.sku) ?? filterMetadata.sku_name ?? null,
+          warehouse_name: item.warehouse_id
+            ? resultWarehouseNameMap.get(item.warehouse_id) ?? null
+            : filterMetadata.warehouse_name,
+        })),
+      }
+    },
+  },
+  {
+    name: 'get_periodic_seasonality',
+    description:
+      'Визначає сезонність продажів у різних календарних розрізах (дні тижня, дні місяця, місяці року) для вибраного періоду.',
+    parameters: {
+      type: 'object',
+      properties: {
+        sku: {
+          type: 'string',
+          description: 'Опційно аналіз конкретного SKU.',
+        },
+        warehouse_id: {
+          type: 'string',
+          description: 'Опційно обмежити конкретний склад.',
+        },
+        from: {
+          type: 'string',
+          description: 'Дата початку (YYYY-MM-DD).',
+        },
+        to: {
+          type: 'string',
+          description: 'Дата завершення (YYYY-MM-DD).',
+        },
+        lookback_days: {
+          type: 'number',
+          description: 'Скільки днів аналізувати, якщо не задано from/to (1..365, дефолт 180).',
+        },
+        granularities: {
+          type: 'array',
+          items: { type: 'string', enum: ['weekday', 'day_of_month', 'month'] },
+          description: 'Які сезони аналізувати. За замовчуванням всі.',
+        },
+        limit_per_granularity: {
+          type: 'number',
+          description: 'Скільки топ-бакетів повертати на кожен тип (1..10, дефолт 5).',
+        },
+      },
+    },
+    handler: async ({ orgId }, args) => {
+      const parsed = getPeriodicSeasonalitySchema.parse(args ?? {})
+      const today = startOfDay(new Date())
+      const toDate = startOfDay(safeParseDate(parsed.to) ?? today)
+      const fromDate = startOfDay(
+        parsed.from
+          ? new Date(parsed.from)
+          : subDays(toDate, clampNumber(Number(parsed.lookback_days ?? 180), 30, 365)),
+      )
+      const toExclusive = addDays(toDate, 1)
+      const granularities = parsed.granularities?.length
+        ? Array.from(new Set(parsed.granularities))
+        : (['weekday', 'day_of_month', 'month'] as const)
+      const limitPerGranularity = clampNumber(Number(parsed.limit_per_granularity ?? 5), 1, 10)
+      const filterMetadataPromise = resolveFilterMetadata(
+        orgId,
+        parsed.sku ?? null,
+        parsed.warehouse_id ?? null,
+      )
+
+      const rows = (await prisma.sales_daily.findMany({
+        where: {
+          org_id: orgId,
+          date: {
+            gte: fromDate,
+            lt: toExclusive,
+          },
+          ...(parsed.sku ? { sku: parsed.sku } : {}),
+          ...(parsed.warehouse_id ? { warehouse_id: parsed.warehouse_id } : {}),
+        },
+        select: {
+          date: true,
+          units: true,
+        },
+      })) as Array<{ date: Date; units: Prisma.Decimal | null }>
+
+      if (!rows.length) {
+        const filterMetadata = await filterMetadataPromise
+        return {
+          message: 'За обраний період не знайдено продажів.',
+          from: formatISO(fromDate, { representation: 'date' }),
+          to: formatISO(addDays(toExclusive, -1), { representation: 'date' }),
+          filters: {
+            sku: parsed.sku ?? null,
+            warehouse_id: parsed.warehouse_id ?? null,
+            sku_name: filterMetadata.sku_name,
+            warehouse_name: filterMetadata.warehouse_name,
+          },
+        }
+      }
+
+      const overallUnits = rows.reduce((sum, row) => sum + Number(row.units ?? 0), 0)
+      const overallAvg = overallUnits / Math.max(rows.length, 1)
+
+      const result: Record<
+        'weekday' | 'day_of_month' | 'month',
+        Array<{ bucket: number; label: string; avg_units: number; uplift_pct: number; observations: number }>
+      > = {
+        weekday: [],
+        day_of_month: [],
+        month: [],
+      }
+
+      const accumulate = (
+        map: Map<number, { sum: number; count: number }>,
+        bucket: number,
+        value: number,
+      ) => {
+        const entry = map.get(bucket) ?? { sum: 0, count: 0 }
+        entry.sum += value
+        entry.count += 1
+        map.set(bucket, entry)
+      }
+
+      const weekdayMap = new Map<number, { sum: number; count: number }>()
+      const dayOfMonthMap = new Map<number, { sum: number; count: number }>()
+      const monthMap = new Map<number, { sum: number; count: number }>()
+
+      for (const row of rows) {
+        const units = Number(row.units ?? 0)
+        const weekday = row.date.getUTCDay() || 7
+        const dayOfMonth = row.date.getUTCDate()
+        const month = row.date.getUTCMonth() + 1
+        accumulate(weekdayMap, weekday, units)
+        accumulate(dayOfMonthMap, dayOfMonth, units)
+        accumulate(monthMap, month, units)
+      }
+
+      const processMap = (
+        map: Map<number, { sum: number; count: number }>,
+        labelFn: (bucket: number) => string,
+      ) =>
+        Array.from(map.entries())
+          .map(([bucket, data]) => {
+            const avg = data.sum / Math.max(data.count, 1)
+            const uplift = overallAvg > 0 ? (avg / overallAvg - 1) * 100 : 0
+            return {
+              bucket,
+              label: labelFn(bucket),
+              avg_units: Number(avg.toFixed(2)),
+              uplift_pct: Number(uplift.toFixed(1)),
+              observations: data.count,
+            }
+          })
+          .sort((a, b) => b.uplift_pct - a.uplift_pct || b.avg_units - a.avg_units)
+          .slice(0, limitPerGranularity)
+
+      if (granularities.includes('weekday')) {
+        result.weekday = processMap(weekdayMap, weekdayLabel)
+      }
+      if (granularities.includes('day_of_month')) {
+        result.day_of_month = processMap(dayOfMonthMap, (bucket) => `День ${bucket}`)
+      }
+      if (granularities.includes('month')) {
+        result.month = processMap(monthMap, monthLabel)
+      }
+
+      const filterMetadata = await filterMetadataPromise
+
+      return {
+        from: formatISO(fromDate, { representation: 'date' }),
+        to: formatISO(addDays(toExclusive, -1), { representation: 'date' }),
+        overall_avg_units: Number(overallAvg.toFixed(2)),
+        filters: {
+          sku: parsed.sku ?? null,
+          warehouse_id: parsed.warehouse_id ?? null,
+          sku_name: filterMetadata.sku_name,
+          warehouse_name: filterMetadata.warehouse_name,
+        },
+        granularities: result,
       }
     },
   },
@@ -209,12 +795,32 @@ export const assistantTools: ToolDefinition[] = [
         take: limit,
       })) as SalesDailyRow[]
 
+      const dayIso = formatISO(targetDate, { representation: 'date' })
+      const skuNameMap = await loadSkuNames(
+        orgId,
+        Array.from(new Set(rows.map((row) => row.sku))),
+      )
+      const warehouseIdSet = new Set<string>()
+      if (parsed.warehouse_id) warehouseIdSet.add(parsed.warehouse_id)
+      rows.forEach((row) => {
+        if (row.warehouse_id) warehouseIdSet.add(row.warehouse_id)
+      })
+      const warehouseNameMap = await loadWarehouseNames(Array.from(warehouseIdSet))
+      const topWarehouseName = parsed.warehouse_id
+        ? warehouseNameMap.get(parsed.warehouse_id) ?? null
+        : null
+
       return {
-        date: formatISO(targetDate, { representation: 'date' }),
+        date: dayIso,
+        from: dayIso,
+        to: dayIso,
         warehouse_id: parsed.warehouse_id ?? null,
+        warehouse_name: topWarehouseName,
         rows: rows.map((row) => ({
           sku: row.sku,
+          sku_name: skuNameMap.get(row.sku) ?? null,
           warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_id ? warehouseNameMap.get(row.warehouse_id) ?? null : null,
           units: Number(row.units ?? 0),
           revenue: Number(row.revenue ?? 0),
           channel: row.channel,
@@ -287,10 +893,28 @@ export const assistantTools: ToolDefinition[] = [
         }
       }
 
+      const warehouseIdSet = new Set<string>()
+      if (parsed.warehouse_id) warehouseIdSet.add(parsed.warehouse_id)
+      rows.forEach((row) => {
+        if (row.warehouse_id) warehouseIdSet.add(row.warehouse_id)
+      })
+      const [skuNameMap, warehouseNameMap] = await Promise.all([
+        loadSkuNames(orgId, [parsed.sku]),
+        loadWarehouseNames(Array.from(warehouseIdSet)),
+      ])
+      const skuName = skuNameMap.get(parsed.sku) ?? null
+      const primaryWarehouseName = parsed.warehouse_id
+        ? warehouseNameMap.get(parsed.warehouse_id) ?? null
+        : null
+
       if (!rows.length) {
         return {
           sku: parsed.sku,
+          sku_name: skuName,
           warehouse_id: parsed.warehouse_id ?? null,
+          warehouse_name: primaryWarehouseName,
+          requested_date: parsed.date ?? null,
+          effective_date: null,
           message: 'Немає знімків залишків для вказаних параметрів.',
         }
       }
@@ -301,14 +925,21 @@ export const assistantTools: ToolDefinition[] = [
         .filter(Boolean)
         .sort((a, b) => (a!.getTime() - b!.getTime()))[0]
 
+      const effectiveDate = formatISO(startOfDay(rows[0].date), { representation: 'date' })
+
       return {
         sku: parsed.sku,
+        sku_name: skuName,
         warehouse_id: parsed.warehouse_id ?? null,
-        date: formatISO(startOfDay(rows[0].date), { representation: 'date' }),
+        warehouse_name: primaryWarehouseName,
+        requested_date: parsed.date ?? null,
+        effective_date: effectiveDate,
+        date: effectiveDate,
         qty_on_hand: total,
         earliest_expiry: earliestExpiry ? earliestExpiry.toISOString() : null,
         batches: rows.map((row) => ({
           warehouse_id: row.warehouse_id,
+          warehouse_name: row.warehouse_id ? warehouseNameMap.get(row.warehouse_id) ?? null : null,
           batch_id: row.batch_id,
           qty: Number(row.qty_on_hand ?? 0),
           expiry_date: row.expiry_date?.toISOString() ?? null,
@@ -349,12 +980,20 @@ export const assistantTools: ToolDefinition[] = [
       const parsed = getStockByWarehouseSchema.parse(args ?? {})
       const limit = clampNumber(parsed.limit ?? 50, 1, 200)
       const sortBy = parsed.sort_by ?? 'qty_desc'
+      const skuNamePromise = loadSkuNames(orgId, [parsed.sku])
       const distribution = await loadStockDistribution(orgId, parsed.sku, {
         requestedDate: parsed.date,
         warehouseIds: parsed.warehouse_ids,
       })
+      const skuName = (await skuNamePromise).get(parsed.sku) ?? null
       if (!distribution) {
-        return { message: 'Немає знімків залишків для цього SKU.' }
+        return {
+          message: 'Немає знімків залишків для цього SKU.',
+          sku: parsed.sku,
+          sku_name: skuName,
+          requested_date: parsed.date ?? null,
+          effective_date: null,
+        }
       }
       const warehouseIds = distribution.rows.map((row) => row.warehouse_id)
       const warehouseNames = warehouseIds.length
@@ -389,6 +1028,7 @@ export const assistantTools: ToolDefinition[] = [
 
       return {
         sku: parsed.sku,
+        sku_name: skuName,
         requested_date: parsed.date ?? null,
         effective_date: formatISO(distribution.effectiveDate, { representation: 'date' }),
         total_qty: totalQty,
@@ -439,11 +1079,28 @@ export const assistantTools: ToolDefinition[] = [
     handler: async ({ orgId }, args) => {
       const parsed = getSalesSummarySchema.parse(args ?? {})
       const today = startOfDay(new Date())
-      const fromDate = startOfDay(safeParseDate(parsed.from) ?? subDays(today, 30))
-      let toDateExclusive = addDays(startOfDay(safeParseDate(parsed.to) ?? today), 1)
+      const requestedTo = safeParseDate(parsed.to)
+      let toDateExclusive = addDays(startOfDay(requestedTo ?? today), 1)
+      let fromDate: Date
+      if (parsed.from) {
+        fromDate = startOfDay(new Date(parsed.from))
+      } else if (parsed.days) {
+        const clamped = clampNumber(Number(parsed.days), 1, 365)
+        fromDate = subDays(toDateExclusive, clamped)
+      } else {
+        fromDate = startOfDay(subDays(today, 30))
+      }
+      if (fromDate >= toDateExclusive) {
+        fromDate = subDays(toDateExclusive, 1)
+      }
       const groupBy = parsed.group_by ?? (parsed.sku ? 'warehouse' : 'sku')
       const metric = parsed.metric ?? 'units'
       const limit = clampNumber(parsed.limit ?? 50, 1, 200)
+      const filterMetadataPromise = resolveFilterMetadata(
+        orgId,
+        parsed.sku ?? null,
+        parsed.warehouse_id ?? null,
+      )
 
       const baseWhere = {
         org_id: orgId,
@@ -485,7 +1142,7 @@ export const assistantTools: ToolDefinition[] = [
 
       let rows = await runSummary(fromDate, toDateExclusive)
 
-      if (!rows.length && !parsed.from && !parsed.to) {
+      if (!rows.length && !parsed.from && !parsed.to && !parsed.days) {
         const oldest = await prisma.sales_daily.findFirst({
           where: baseWhere,
           orderBy: { date: 'asc' },
@@ -510,6 +1167,15 @@ export const assistantTools: ToolDefinition[] = [
           })
         : []
       const nameMap = new Map(warehouseNames.map((row) => [row.id, row.name]))
+      const skuIdSet = new Set<string>()
+      rows.forEach((row) => {
+        if (row.sku) skuIdSet.add(row.sku)
+      })
+      if (parsed.sku) skuIdSet.add(parsed.sku)
+      const [skuNameMap, filterMetadata] = await Promise.all([
+        loadSkuNames(orgId, Array.from(skuIdSet)),
+        filterMetadataPromise,
+      ])
 
       return {
         from: formatISO(fromDate, { representation: 'date' }),
@@ -519,6 +1185,8 @@ export const assistantTools: ToolDefinition[] = [
         filters: {
           sku: parsed.sku ?? null,
           warehouse_id: parsed.warehouse_id ?? null,
+          sku_name: filterMetadata.sku_name,
+          warehouse_name: filterMetadata.warehouse_name,
         },
         rows: rows.map((row) => ({
           warehouse_id: row.warehouse_id ?? null,
@@ -527,9 +1195,95 @@ export const assistantTools: ToolDefinition[] = [
               ? nameMap.get(row.warehouse_id)
               : row.warehouse_id ?? null,
           sku: row.sku ?? null,
+          sku_name: row.sku ? skuNameMap.get(row.sku) ?? null : null,
           units: Number(row._sum.units ?? 0),
           revenue: Number(row._sum.revenue ?? 0),
         })),
+      }
+    },
+  },
+  {
+    name: 'get_sales_windows',
+    description:
+      'Швидко повертає агреговані продажі (units/revenue) за набором ковзних вікон — наприклад, 10/30/60/90 днів.',
+    parameters: {
+      type: 'object',
+      properties: {
+        sku: {
+          type: 'string',
+          description: 'Опційно обмежити одним SKU.',
+        },
+        warehouse_id: {
+          type: 'string',
+          description: 'Опційно обмежити одним складом.',
+        },
+        windows: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Список вікон у днях (1..365). За замовчуванням [10,30,60,90].',
+        },
+      },
+    },
+    handler: async ({ orgId }, args) => {
+      const parsed = getSalesWindowsSchema.parse(args ?? {})
+      const today = startOfDay(new Date())
+      const uniqueWindows = Array.from(
+        new Set(
+          (parsed.windows ?? DEFAULT_SALES_WINDOWS)
+            .map((value) => clampNumber(Number(value), 1, 365))
+            .filter((value) => value > 0),
+        ),
+      ).sort((a, b) => a - b)
+      if (!uniqueWindows.length) {
+        return { message: 'Не передано коректних вікон для аналізу.' }
+      }
+
+      const baseWhere = {
+        org_id: orgId,
+        ...(parsed.sku ? { sku: parsed.sku } : {}),
+        ...(parsed.warehouse_id ? { warehouse_id: parsed.warehouse_id } : {}),
+      }
+
+      const rows = []
+      for (const windowDays of uniqueWindows) {
+        const fromDate = subDays(today, windowDays)
+        const aggregate = await prisma.sales_daily.aggregate({
+          where: {
+            ...baseWhere,
+            date: {
+              gte: fromDate,
+              lte: today,
+            },
+          },
+          _sum: {
+            units: true,
+            revenue: true,
+          },
+        })
+        rows.push({
+          window_days: windowDays,
+          from: formatISO(fromDate, { representation: 'date' }),
+          to: formatISO(today, { representation: 'date' }),
+          units: Number(aggregate._sum.units ?? 0),
+          revenue: Number(aggregate._sum.revenue ?? 0),
+          avg_daily_units: Number((aggregate._sum.units ?? 0)) / windowDays,
+        })
+      }
+
+      const filterMetadata = await resolveFilterMetadata(
+        orgId,
+        parsed.sku ?? null,
+        parsed.warehouse_id ?? null,
+      )
+
+      return {
+        filters: {
+          sku: parsed.sku ?? null,
+          warehouse_id: parsed.warehouse_id ?? null,
+          sku_name: filterMetadata.sku_name,
+          warehouse_name: filterMetadata.warehouse_name,
+        },
+        windows: rows,
       }
     },
   },
@@ -547,15 +1301,31 @@ export const assistantTools: ToolDefinition[] = [
     },
     handler: async ({ orgId }, args) => {
       const parsed = getBufferSchema.parse(args ?? {})
-      const payload = await buildExplainPayload({
-        orgId,
-        warehouseId: parsed.warehouse_id,
-        sku: parsed.sku,
-      })
+      const analysisDate = formatISO(new Date(), { representation: 'date' })
+      const [payload, filterMetadata] = await Promise.all([
+        buildExplainPayload({
+          orgId,
+          warehouseId: parsed.warehouse_id,
+          sku: parsed.sku,
+          date: analysisDate,
+        }),
+        resolveFilterMetadata(orgId, parsed.sku, parsed.warehouse_id),
+      ])
       if (!payload) {
-        return { message: 'Буфер для вказаного SKU не знайдено.' }
+        return {
+          message: 'Буфер для вказаного SKU не знайдено.',
+          sku: parsed.sku,
+          sku_name: filterMetadata.sku_name,
+          warehouse_id: parsed.warehouse_id,
+          warehouse_name: filterMetadata.warehouse_name,
+          date: analysisDate,
+        }
       }
-      return payload
+      return {
+        ...payload,
+        sku_name: payload.sku_name ?? filterMetadata.sku_name ?? null,
+        warehouse_name: payload.warehouse_name ?? filterMetadata.warehouse_name ?? null,
+      }
     },
   },
   {
@@ -600,9 +1370,28 @@ export const assistantTools: ToolDefinition[] = [
         },
       })
 
+      const orderedTimestamps = orders.map((order) => order.ordered_at.getTime())
+      const orderedFrom =
+        orderedTimestamps.length > 0
+          ? formatISO(new Date(Math.min(...orderedTimestamps)), { representation: 'date' })
+          : null
+      const orderedTo =
+        orderedTimestamps.length > 0
+          ? formatISO(new Date(Math.max(...orderedTimestamps)), { representation: 'date' })
+          : null
+      const skuIdSet = new Set<string>()
+      if (parsed.sku) skuIdSet.add(parsed.sku)
+      orders.forEach((order) =>
+        order.purchase_order_lines.forEach((line) => skuIdSet.add(line.sku)),
+      )
+      const skuNameMap = await loadSkuNames(orgId, Array.from(skuIdSet))
+
       return {
         status: parsed.status ?? 'all',
         sku: parsed.sku ?? null,
+        sku_name: parsed.sku ? skuNameMap.get(parsed.sku) ?? null : null,
+        ordered_from: orderedFrom,
+        ordered_to: orderedTo,
         orders: orders.map((order) => ({
           po_id: order.po_id,
           supplier_id: order.supplier_id,
@@ -610,6 +1399,7 @@ export const assistantTools: ToolDefinition[] = [
           received_at: order.received_at?.toISOString() ?? null,
           lines: order.purchase_order_lines.map((line) => ({
             sku: line.sku,
+            sku_name: skuNameMap.get(line.sku) ?? null,
             qty: Number(line.qty),
             moq: line.moq,
             pack_size: line.pack_size,
@@ -642,6 +1432,7 @@ export const assistantTools: ToolDefinition[] = [
       })
       const parsed = schema.parse(args ?? {})
       const date = parsed.date ?? formatISO(new Date(), { representation: 'date' })
+      const filterMetadataPromise = resolveFilterMetadata(orgId, parsed.sku, parsed.warehouse_id)
       const { data: recs } = await getRecommendations({
         orgId,
         warehouseId: parsed.warehouse_id,
@@ -650,10 +1441,25 @@ export const assistantTools: ToolDefinition[] = [
         pageSize: 100,
       })
       const match = recs.find((row) => row.sku === parsed.sku)
+      const filterMetadata = await filterMetadataPromise
       if (!match) {
-        return { message: 'Рекомендацію для цього SKU не знайдено.' }
+        return {
+          message: 'Рекомендацію для цього SKU не знайдено.',
+          date,
+          warehouse_id: parsed.warehouse_id,
+          sku: parsed.sku,
+          warehouse_name: filterMetadata.warehouse_name,
+          sku_name: filterMetadata.sku_name,
+        }
       }
-      return { date, warehouse_id: parsed.warehouse_id, ...match }
+      return {
+        date,
+        warehouse_id: parsed.warehouse_id,
+        warehouse_name: filterMetadata.warehouse_name,
+        sku: parsed.sku,
+        sku_name: filterMetadata.sku_name,
+        ...match,
+      }
     },
   },
   {
@@ -679,6 +1485,7 @@ export const assistantTools: ToolDefinition[] = [
     handler: async ({ orgId }, args) => {
       const parsed = suggestRebalanceSchema.parse(args ?? {})
       const maxMoves = clampNumber(parsed.max_moves ?? 5, 1, 20)
+      const skuName = (await loadSkuNames(orgId, [parsed.sku])).get(parsed.sku) ?? null
       const bufferRows = await prisma.buffers.findMany({
         where: {
           org_id: orgId,
@@ -686,7 +1493,11 @@ export const assistantTools: ToolDefinition[] = [
         },
       })
       if (!bufferRows.length) {
-        return { message: 'Для цього SKU ще не розраховані буфери ТОС.' }
+        return {
+          message: 'Для цього SKU ще не розраховані буфери ТОС.',
+          sku: parsed.sku,
+          sku_name: skuName,
+        }
       }
       const warehouseIds = bufferRows.map((row) => row.warehouse_id)
       const distribution = await loadStockDistribution(orgId, parsed.sku, {
@@ -694,7 +1505,13 @@ export const assistantTools: ToolDefinition[] = [
         warehouseIds,
       })
       if (!distribution) {
-        return { message: 'Немає актуальних знімків запасів для цього SKU.' }
+        return {
+          message: 'Немає актуальних знімків запасів для цього SKU.',
+          sku: parsed.sku,
+          sku_name: skuName,
+          requested_date: parsed.date ?? null,
+          effective_date: null,
+        }
       }
       const stockMap = new Map(
         distribution.rows.map((row) => [row.warehouse_id, Number(row._sum.qty_on_hand ?? 0)]),
@@ -766,6 +1583,7 @@ export const assistantTools: ToolDefinition[] = [
 
       return {
         sku: parsed.sku,
+        sku_name: skuName,
         requested_date: parsed.date ?? null,
         effective_date: formatISO(distribution.effectiveDate, { representation: 'date' }),
         warehouses: analysis.map((row) => ({
@@ -787,6 +1605,48 @@ export const assistantTools: ToolDefinition[] = [
     },
   },
 ]
+
+async function loadSkuNames(orgId: string, skuIds: string[]) {
+  const unique = Array.from(new Set(skuIds.filter((id): id is string => Boolean(id))))
+  if (!unique.length) {
+    return new Map<string, string>()
+  }
+  const rows = await prisma.catalog.findMany({
+    where: {
+      org_id: orgId,
+      sku: { in: unique },
+    },
+    select: { sku: true, name: true },
+  })
+  return new Map(rows.map((row) => [row.sku, row.name]))
+}
+
+async function loadWarehouseNames(warehouseIds: string[]) {
+  const unique = Array.from(new Set(warehouseIds.filter((id): id is string => Boolean(id))))
+  if (!unique.length) {
+    return new Map<string, string>()
+  }
+  const rows = await prisma.warehouses.findMany({
+    where: { id: { in: unique } },
+    select: { id: true, name: true },
+  })
+  return new Map(rows.map((row) => [row.id, row.name]))
+}
+
+async function resolveFilterMetadata(
+  orgId: string,
+  sku?: string | null,
+  warehouseId?: string | null,
+) {
+  const [skuMap, warehouseMap] = await Promise.all([
+    sku ? loadSkuNames(orgId, [sku]) : Promise.resolve(new Map<string, string>()),
+    warehouseId ? loadWarehouseNames([warehouseId]) : Promise.resolve(new Map<string, string>()),
+  ])
+  return {
+    sku_name: sku ? skuMap.get(sku) ?? null : null,
+    warehouse_name: warehouseId ? warehouseMap.get(warehouseId) ?? null : null,
+  }
+}
 
 export const openAiToolDefinitions = assistantTools.map((tool) => ({
   type: 'function' as const,
@@ -875,6 +1735,42 @@ function safeParseDate(value?: string | null) {
   if (!value) return null
   const parsed = new Date(value)
   return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
+function getWeekKey(date: Date) {
+  return `${date.getUTCFullYear()}-W${String(getISOWeek(date)).padStart(2, '0')}`
+}
+
+function weekdayLabel(weekday: number) {
+  const labels: Record<number, string> = {
+    1: 'Понеділок',
+    2: 'Вівторок',
+    3: 'Середа',
+    4: 'Четвер',
+    5: "П'ятниця",
+    6: 'Субота',
+    7: 'Неділя',
+  }
+  if (weekday === 0) return 'Неділя'
+  return labels[weekday] ?? `День ${weekday}`
+}
+
+function monthLabel(month: number) {
+  const labels: Record<number, string> = {
+    1: 'Січень',
+    2: 'Лютий',
+    3: 'Березень',
+    4: 'Квітень',
+    5: 'Травень',
+    6: 'Червень',
+    7: 'Липень',
+    8: 'Серпень',
+    9: 'Вересень',
+    10: 'Жовтень',
+    11: 'Листопад',
+    12: 'Грудень',
+  }
+  return labels[month] ?? `Місяць ${month}`
 }
 
 function resolveZoneValue(onHand: number, red: number, yellow: number): 'red' | 'yellow' | 'green' {

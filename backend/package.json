@@ -16,6 +16,7 @@
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
     "seed": "tsx scripts/seed.ts",
+    "db:delete-warehouse": "tsx scripts/delete-warehouse.ts",
     "import:turnover": "tsx scripts/import-turnover.ts"
   },
   "dependencies": {
