@@ -1,0 +1,125 @@
+  {
+    name: 'get_purchase_orders',
+    description:
+      'Повертає останні замовлення постачальникам з рядками (можна фільтрувати за статусом чи SKU).',
+    parameters: {
+      type: 'object',
+      properties: {
+        sku: { type: 'string', description: 'SKU, за яким потрібно відфільтрувати рядки.' },
+        status: {
+          type: 'string',
+          enum: ['pending', 'received', 'all'],
+          description: 'Статус PO: pending (ще в дорозі), received або all.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Кількість замовлень (1..50, за замовчуванням 10).',
+        },
+      },
+    },
+    handler: async ({ orgId }, args) => {
+      const parsed = getPurchaseOrdersSchema.parse(args ?? {})
+      const limit = clampNumber(parsed.limit ?? 10, 1, 50)
+      const where: Parameters<typeof prisma.purchase_orders.findMany>[0]['where'] = {
+        org_id: orgId,
+      }
+      if (parsed.status === 'pending') {
+        where.received_at = null
+      } else if (parsed.status === 'received') {
+        where.received_at = { not: null }
+      }
+
+      const orders = await prisma.purchase_orders.findMany({
+        where,
+        orderBy: { ordered_at: 'desc' },
+        take: limit,
+        include: {
+          purchase_order_lines: {
+            where: parsed.sku ? { sku: parsed.sku } : undefined,
+          },
+        },
+      })
+
+      return {
+        status: parsed.status ?? 'all',
+        sku: parsed.sku ?? null,
+        orders: orders.map((order) => ({
+          po_id: order.po_id,
+          supplier_id: order.supplier_id,
+          ordered_at: order.ordered_at.toISOString(),
+          received_at: order.received_at?.toISOString() ?? null,
+          lines: order.purchase_order_lines.map((line) => ({
+            sku: line.sku,
+            qty: Number(line.qty),
+            moq: line.moq,
+            pack_size: line.pack_size,
+          })),
+        })),
+      }
+    },
+  },
+  {
+    name: 'get_recommendations_for_sku',
+    description:
+      'Повертає ТОС-рекомендацію для конкретного SKU на складі (target, on_hand, suggested).',
+    parameters: {
+      type: 'object',
+      properties: {
+        warehouse_id: { type: 'string' },
+        sku: { type: 'string' },
+        date: {
+          type: 'string',
+          description: 'Дата у форматі YYYY-MM-DD. За замовчуванням — сьогодні.',
+        },
+      },
+      required: ['warehouse_id', 'sku'],
+    },
+    handler: async ({ orgId }, args) => {
+      const schema = z.object({
+        warehouse_id: z.string().trim().min(2).max(64),
+        sku: z.string().trim().min(1),
+        date: z.string().trim().optional(),
+      })
+      const parsed = schema.parse(args ?? {})
+      const date = parsed.date ?? formatISO(new Date(), { representation: 'date' })
+      const recs = await getRecommendations({
+        orgId,
+        warehouseId: parsed.warehouse_id,
+        date,
+        autoRecalc: true,
+      })
+      const match = recs.find((row) => row.sku === parsed.sku)
+      if (!match) {
+        return { message: 'Рекомендацію для цього SKU не знайдено.' }
+      }
+      return { date, warehouse_id: parsed.warehouse_id, ...match }
+    },
+  },
+]
+
+export const openAiToolDefinitions = assistantTools.map((tool) => ({
+  type: 'function' as const,
+  function: {
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  },
+}))
+
+export async function executeAssistantTool(
+  toolName: string,
+  ctx: ToolContext,
+  argsJson: string | null | undefined,
+) {
+  const def = assistantTools.find((tool) => tool.name === toolName)
+  if (!def) {
+    throw new Error(`Невідомий інструмент AI: ${toolName}`)
+  }
+  let parsedArgs: unknown
+  try {
+    parsedArgs = argsJson ? JSON.parse(argsJson) : {}
+  } catch (error) {
+    throw new Error(`Не вдалося розібрати аргументи для ${toolName}: ${(error as Error).message}`)
+  }
+  return def.handler(ctx, parsedArgs)
+}

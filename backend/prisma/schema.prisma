@@ -1,0 +1,203 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DB_URL")
+}
+
+enum user_role {
+  admin
+  viewer
+}
+
+model orgs {
+  id          String       @id
+  name        String
+  api_key     String       @unique
+  created_at  DateTime     @default(now())
+  warehouses  warehouses[]
+  suppliers   suppliers[]
+  catalog     catalog[]
+  users       users[]
+  sessions    sessions[]
+  @@map("orgs")
+}
+
+model warehouses {
+  id         String   @id
+  org_id     String
+  name       String
+  timezone   String?  @default("UTC")
+  created_at DateTime @default(now())
+  orgs       orgs     @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  @@map("warehouses")
+}
+
+model suppliers {
+  id         String   @id
+  org_id     String
+  name       String
+  lead_time_days_default Decimal?
+  contact    String?
+  created_at DateTime @default(now())
+  orgs       orgs     @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  @@map("suppliers")
+}
+
+model catalog {
+  org_id          String
+  sku             String
+  name            String
+  category        String?
+  uom             String?
+  shelf_life_days Int?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @default(now())
+  orgs            orgs     @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  @@id([org_id, sku])
+  @@map("catalog")
+}
+
+model sales_events {
+  org_id         String
+  order_id       String
+  line_id        String
+  order_datetime DateTime
+  sku            String
+  qty            Decimal   @default(0)
+  unit_price     Decimal?
+  discount_amount Decimal?
+  net_amount     Decimal?
+  tax_amount     Decimal?
+  currency       String?   @default("UAH")
+  warehouse_id   String?
+  channel        String?
+  status         String?
+  returned_qty   Decimal?  @default(0)
+  canceled_qty   Decimal?  @default(0)
+  promo_code     String?
+  updated_at     DateTime  @default(now())
+  @@id([org_id, order_id, line_id])
+  @@index([order_datetime], map: "sales_events_datetime_idx")
+  @@map("sales_events")
+}
+
+model sales_daily {
+  org_id       String
+  date         DateTime
+  sku          String
+  warehouse_id String
+  channel      String   @default("ALL")
+  units        Decimal  @default(0)
+  revenue      Decimal  @default(0)
+  orders       Int      @default(0)
+  updated_at   DateTime @default(now())
+  @@id([org_id, date, sku, warehouse_id, channel])
+  @@index([date, sku, warehouse_id, channel], map: "sales_daily_date_sku_idx")
+  @@map("sales_daily")
+}
+
+model stock_snapshots {
+  id           String   @id @default(uuid())
+  org_id       String
+  date         DateTime
+  sku          String
+  warehouse_id String
+  qty_on_hand  Decimal  @default(0)
+  batch_id     String   @default("_default")
+  expiry_date  DateTime?
+  updated_at   DateTime @default(now())
+  @@unique([org_id, date, sku, warehouse_id, batch_id], map: "stock_snapshot_org_date_sku_wh_batch_idx")
+  @@map("stock_snapshots")
+}
+
+model purchase_orders {
+  org_id      String
+  po_id       String
+  supplier_id String
+  ordered_at  DateTime
+  received_at DateTime?
+  created_at  DateTime @default(now())
+  @@id([org_id, po_id])
+  @@map("purchase_orders")
+}
+
+model purchase_order_lines {
+  org_id    String
+  po_id     String
+  sku       String
+  qty       Decimal
+  moq       Int?
+  pack_size Int?
+  created_at DateTime @default(now())
+  @@id([org_id, po_id, sku])
+  @@map("purchase_order_lines")
+}
+
+model lead_time_stats {
+  org_id               String
+  supplier_id          String
+  sku                  String
+  lead_time_days_median Decimal @default(0)
+  sample_size          Int     @default(0)
+  updated_at           DateTime @default(now())
+  @@id([org_id, supplier_id, sku])
+  @@map("lead_time_stats")
+}
+
+model buffers {
+  org_id         String
+  sku            String
+  warehouse_id   String
+  lead_time_days Decimal @default(0)
+  avg_daily_demand Decimal @default(0)
+  buffer_qty     Decimal @default(0)
+  red_th         Decimal @default(0)
+  yellow_th      Decimal @default(0)
+  updated_at     DateTime @default(now())
+  @@id([org_id, sku, warehouse_id])
+  @@map("buffers")
+}
+
+model recommendations {
+  id            String   @id @default(uuid())
+  org_id        String
+  date          DateTime
+  sku           String
+  warehouse_id  String
+  target        Decimal  @default(0)
+  on_hand       Decimal  @default(0)
+  inbound       Decimal  @default(0)
+  suggested_qty Decimal  @default(0)
+  reason        String?
+  created_at    DateTime @default(now())
+  @@map("recommendations")
+}
+
+model users {
+  id            String    @id @default(uuid())
+  org_id        String
+  email         String
+  name          String?
+  password_hash String
+  role          user_role @default(viewer)
+  created_at    DateTime  @default(now())
+  org           orgs      @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  sessions      sessions[]
+  @@unique([email])
+  @@map("users")
+}
+
+model sessions {
+  id         String   @id @default(uuid())
+  user_id    String
+  org_id     String
+  token      String
+  expires_at DateTime
+  created_at DateTime @default(now())
+  org        orgs     @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user       users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  @@map("sessions")
+}
