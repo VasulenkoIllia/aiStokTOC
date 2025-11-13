@@ -5,7 +5,6 @@ dist
 out
 coverage
 .env
-.env.*
 backend/.env
 frontend/.env
 frontend/.vercel
